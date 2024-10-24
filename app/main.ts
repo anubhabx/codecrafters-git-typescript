@@ -12,11 +12,12 @@ enum Commands {
   CatFile = "cat-file",
   HashObject = "hash-object",
   LSTree = "ls-tree",
+  WriteTree = "write-tree",
 }
 
 interface TreeEntry {
   mode: string;
-  type: string;
+  // type: string;
   hash: string;
   name: string;
 }
@@ -52,10 +53,10 @@ class GitCommand {
       throw new Error("Invalid git object format: no null byte found");
     }
 
-    const header = inflated.slice(0, nullByteIndex).toString("utf-8");
+    const header = inflated.subarray(0, nullByteIndex).toString("utf-8");
     const [type, size] = header.split(" ");
 
-    const content = inflated.slice(nullByteIndex + 1);
+    const content = inflated.subarray(nullByteIndex + 1);
     const contentSize = parseInt(size);
     if (content.length !== contentSize) {
       throw new Error(
@@ -96,24 +97,21 @@ class GitCommand {
       let spaceIndex = buffer.indexOf(0x20, position);
       if (spaceIndex === -1) break;
 
-      const mode = buffer.slice(position, spaceIndex).toString("utf-8");
+      const mode = buffer.subarray(position, spaceIndex).toString("utf-8");
 
       // Find the null byte that separates path from hash
       let nullIndex = buffer.indexOf(0x00, spaceIndex + 1);
       if (nullIndex === -1) break;
 
-      const entryInfo = buffer
-        .subarray(spaceIndex + 1, nullIndex)
-        .toString("utf-8");
-      const lastSpaceIndex = entryInfo.lastIndexOf(" ");
-      const name = entryInfo.slice(lastSpaceIndex + 1);
-      const type = entryInfo.slice(0, lastSpaceIndex);
+      // Extract the name
+      const name = buffer.subarray(spaceIndex + 1, nullIndex).toString("utf-8");
 
       // Extract the 20-byte SHA-1 hash
-      const hashBuffer = buffer.subarray(nullIndex + 1, nullIndex + 21);
-      const hash = hashBuffer.toString("hex");
+      const hash = buffer
+        .subarray(nullIndex + 1, nullIndex + 21)
+        .toString("hex");
 
-      entries.push({ mode, type, hash, name });
+      entries.push({ mode, hash, name });
 
       // Move position to start of next entry
       position = nullIndex + 21;
@@ -169,17 +167,65 @@ class GitCommand {
         if (options.nameOnly) {
           console.log(entry.name);
         } else {
-          console.log(
-            `${entry.mode} ${entry.type} ${entry.hash}\t${entry.name}`
-          );
+          const type = entry.mode === "40000" ? "tree" : "blob";
+          console.log(`${entry.mode} ${type} ${entry.hash}\t${entry.name}`);
         }
 
-        if (options.recursive && entry.type === "tree") {
+        if (options.recursive && entry.mode === "40000") {
           await GitCommand.lsTree(entry.hash, options);
         }
       }
     } catch (error) {
       console.error("Error listing tree:", error);
+      process.exit(1);
+    }
+  }
+
+  private static async writeTree(dirPath: string): Promise<string> {
+    const entries: TreeEntry[] = [];
+    const dirents = await fs.promises.readdir(dirPath, { withFileTypes: true });
+
+    dirents.sort((a, b) => a.name.localeCompare(b.name));
+
+    for (const dirent of dirents) {
+      const fullPath = path.join(dirPath, dirent.name);
+
+      if (dirent.name === ".git") continue;
+
+      if (dirent.isFile()) {
+        const content = await fs.promises.readFile(fullPath);
+        const hash = await GitCommand.writeGitObject("blob", content);
+        entries.push({
+          mode: "100644",
+          name: dirent.name,
+          hash,
+        });
+      } else if (dirent.isDirectory()) {
+        const hash = await GitCommand.writeTree(fullPath);
+        entries.push({
+          mode: "40000",
+          name: dirent.name,
+          hash,
+        });
+      }
+    }
+
+    const treeContent = Buffer.concat(
+      entries.flatMap((entry) => [
+        Buffer.from(`${entry.mode} ${entry.name}\0`),
+        Buffer.from(entry.hash, "hex"),
+      ])
+    );
+
+    return await GitCommand.writeGitObject("tree", treeContent);
+  }
+
+  static async executeWriteTree(): Promise<string> {
+    try {
+      const hash = await GitCommand.writeTree(".");
+      return hash;
+    } catch (error) {
+      console.error("Error writing tree:", error);
       process.exit(1);
     }
   }
@@ -224,6 +270,11 @@ async function main() {
         await GitCommand.lsTree(hashArg, options);
         break;
       }
+
+      case Commands.WriteTree:
+        const hash = await GitCommand.executeWriteTree();
+        process.stdout.write(hash);
+        break;
 
       default:
         throw new Error(`Unknown command ${command}`);
