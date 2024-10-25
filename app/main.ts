@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as zlib from "zlib";
-import path from "path";
+import path, { join } from "path";
 import crypto from "crypto";
 import { promisify } from "util";
 
@@ -13,6 +13,7 @@ enum Commands {
   HashObject = "hash-object",
   LSTree = "ls-tree",
   WriteTree = "write-tree",
+  CommitTree = "commit-tree",
 }
 
 interface TreeEntry {
@@ -34,6 +35,8 @@ interface LsTreeOptions {
 
 class GitCommand {
   private static GIT_DIR = ".git";
+  private static AUTHOR = "Anubhab Debnath <example@email.com>";
+  private static COMMITTER = "Anubhab Debnath <example@email.com>";
 
   private static async readGitObject(hash: string): Promise<Buffer> {
     const objectPath = path.join(
@@ -229,6 +232,32 @@ class GitCommand {
       process.exit(1);
     }
   }
+
+  static async commitTree(
+    treeHash: string,
+    parentHash: string | null,
+    message: string
+  ): Promise<string> {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const timezone = "+0530";
+
+    const commitContent = [
+      `tree ${treeHash}`,
+      parentHash ? `parent ${parentHash}` : "",
+      `author ${GitCommand.AUTHOR} ${timestamp} ${timezone}`,
+      `committer ${GitCommand.COMMITTER} ${timestamp} ${timezone}`,
+      "",
+      message,
+      "",
+    ].join("\n");
+
+    const hash = await GitCommand.writeGitObject(
+      "commit",
+      Buffer.from(commitContent)
+    );
+
+    return hash;
+  }
 }
 
 async function main() {
@@ -275,6 +304,36 @@ async function main() {
         const hash = await GitCommand.executeWriteTree();
         process.stdout.write(hash);
         break;
+
+      case Commands.CommitTree: {
+        if (args.length < 3) {
+          throw new Error(
+            "Usage: commit-tree <tree-hash> [-p <parent-hash>] <message>"
+          );
+        }
+
+        const treeHash = args[1];
+        const parentIndex = args.indexOf("-p");
+        const messageIndex = args.indexOf("-m");
+
+        if (parentIndex === -1 || messageIndex === -1) {
+          throw new Error(
+            "Both parent hash [-p] and commit message [-m] are required"
+          );
+        }
+
+        const parentHash = args[parentIndex + 1];
+        const message = args[messageIndex + 1];
+
+        const commitHash = await GitCommand.commitTree(
+          treeHash,
+          parentHash,
+          message
+        );
+        process.stdout.write(commitHash);
+
+        break;
+      }
 
       default:
         throw new Error(`Unknown command ${command}`);
