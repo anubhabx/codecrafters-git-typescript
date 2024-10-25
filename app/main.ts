@@ -1,8 +1,12 @@
+#!/usr/bin/env node
+
 import * as fs from "fs";
 import * as zlib from "zlib";
-import path, { join } from "path";
+import path, { join, resolve } from "path";
 import crypto from "crypto";
 import { promisify } from "util";
+import https from "https";
+import net from "net";
 
 const inflate = promisify(zlib.inflate);
 const deflate = promisify(zlib.deflate);
@@ -14,6 +18,7 @@ enum Commands {
   LSTree = "ls-tree",
   WriteTree = "write-tree",
   CommitTree = "commit-tree",
+  Clone = "clone",
 }
 
 interface TreeEntry {
@@ -33,12 +38,175 @@ interface LsTreeOptions {
   nameOnly: boolean;
 }
 
+interface PackHeader {
+  signature: string;
+  version: number;
+  numObjects: number;
+}
+
+interface PackObject {
+  type: string;
+  size: number;
+  offset: number;
+  data: Buffer;
+}
+
+class GitCloneCommand {
+  private static async makeHttpRequest(
+    url: string,
+    headers: Record<string, string> = {},
+    postData?: string
+  ): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const method = postData ? "POST" : "GET";
+      const requestOptions = {
+        method,
+        headers: {
+          "User-Agent": "git/2.0.0",
+          ...headers,
+        },
+      };
+
+      const req = https.request(url, requestOptions, (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", () => resolve(Buffer.concat(chunks)));
+      });
+
+      req.on("error", reject);
+
+      if (postData) {
+        req.write(postData);
+      }
+      req.end();
+    });
+  }
+
+  private static parsePackHeader(data: Buffer): { numObjects: number } {
+    const signature = data.subarray(0, 4).toString("utf8");
+    if (signature !== "PACK") {
+      throw new Error("Invalid pack file signature");
+    }
+    const version = data.readUInt32BE(4);
+    const numObjects = data.readUInt32BE(8);
+    return { numObjects };
+  }
+
+  private static async processPackfile(
+    packData: Buffer,
+    gitDir: string
+  ): Promise<void> {
+    let offset = 12; // Skip pack header
+    const { numObjects } = GitCloneCommand.parsePackHeader(packData);
+
+    for (let i = 0; i < numObjects; i++) {
+      let byte = packData[offset++];
+      let type = (byte >> 4) & 7;
+      let size = byte & 15;
+      let shift = 4;
+
+      while (byte & 0x80) {
+        byte = packData[offset++];
+        size |= (byte & 0x7f) << shift;
+        shift += 7;
+      }
+
+      let objectData;
+      if (type === 6 || type === 7) {
+        // Skip delta objects for simplicity
+        offset += size;
+        continue;
+      }
+
+      const compressed = packData.subarray(offset);
+      objectData = await inflate(compressed);
+      offset += compressed.length;
+
+      let objectType;
+      switch (type) {
+        case 1:
+          objectType = "commit";
+          break;
+        case 2:
+          objectType = "tree";
+          break;
+        case 3:
+          objectType = "blob";
+          break;
+        default:
+          throw new Error(`Unknown object type: ${type}`);
+      }
+
+      await GitCommand.writeGitObject(objectType, objectData);
+    }
+  }
+
+  static async clone(url: string, targetDir: string): Promise<void> {
+    // Create target directory and initialize git
+    await fs.promises.mkdir(targetDir, { recursive: true });
+    process.chdir(targetDir);
+    await GitCommand.init();
+
+    // Get repository info
+    const infoUrl = `${url}/info/refs?service=git-upload-pack`;
+    const refs = await GitCloneCommand.makeHttpRequest(infoUrl);
+
+    // Parse refs and get HEAD
+    const lines = refs.toString().split("\n");
+    const head = lines.find((line) => line.includes("HEAD"))?.split(" ")[1];
+
+    if (!head) {
+      throw new Error("Could not find HEAD reference");
+    }
+
+    // Request packfile
+    const uploadPackUrl = `${url}/git-upload-pack`;
+    const wants = `0032want ${head}\n00000009done\n`;
+
+    const packfile = await GitCloneCommand.makeHttpRequest(
+      uploadPackUrl,
+      {
+        "Content-Type": "application/x-git-upload-pack-request",
+      },
+      wants
+    );
+
+    // Process packfile
+    await GitCloneCommand.processPackfile(packfile, ".git");
+
+    // Update HEAD reference
+    await fs.promises.writeFile(
+      path.join(".git", "HEAD"),
+      `ref: refs/heads/main\n`
+    );
+    await fs.promises.writeFile(
+      path.join(".git", "refs", "heads", "main"),
+      head
+    );
+
+    // Checkout files
+    const commitObj = await GitCommand.readGitObject(head);
+    const { content } = await GitCommand.inflateObject(commitObj);
+    const treeHash = content
+      .toString()
+      .split("\n")
+      .find((line) => line.startsWith("tree"))
+      ?.split(" ")[1];
+
+    if (treeHash) {
+      await GitCommand.checkoutTree(treeHash, ".");
+    }
+
+    console.log(`Cloned ${url} into ${targetDir}`);
+  }
+}
+
 class GitCommand {
   private static GIT_DIR = ".git";
   private static AUTHOR = "Anubhab Debnath <example@email.com>";
   private static COMMITTER = "Anubhab Debnath <example@email.com>";
 
-  private static async readGitObject(hash: string): Promise<Buffer> {
+  static async readGitObject(hash: string): Promise<Buffer> {
     const objectPath = path.join(
       GitCommand.GIT_DIR,
       "objects",
@@ -48,7 +216,7 @@ class GitCommand {
     return fs.promises.readFile(objectPath);
   }
 
-  private static async inflateObject(buffer: Buffer): Promise<GitObject> {
+  static async inflateObject(buffer: Buffer): Promise<GitObject> {
     const inflated = await inflate(buffer);
 
     const nullByteIndex = inflated.indexOf(0);
@@ -70,10 +238,7 @@ class GitCommand {
     return { type, content };
   }
 
-  private static async writeGitObject(
-    type: string,
-    content: Buffer
-  ): Promise<string> {
+  static async writeGitObject(type: string, content: Buffer): Promise<string> {
     const header = Buffer.from(`${type} ${content.length}\0`);
     const store = Buffer.concat([header, content]);
 
@@ -91,7 +256,7 @@ class GitCommand {
     return hash;
   }
 
-  private static parseTreeContent(buffer: Buffer): TreeEntry[] {
+  static parseTreeContent(buffer: Buffer): TreeEntry[] {
     const entries: TreeEntry[] = [];
     let position = 0;
 
@@ -258,6 +423,32 @@ class GitCommand {
 
     return hash;
   }
+
+  static async checkoutTree(
+    treeHash: string,
+    targetPath: string
+  ): Promise<void> {
+    const buffer = await GitCommand.readGitObject(treeHash);
+    const { content } = await GitCommand.inflateObject(buffer);
+    const entries = GitCommand.parseTreeContent(content);
+
+    for (const entry of entries) {
+      const entryPath = path.join(targetPath, entry.name);
+
+      if (entry.mode === "40000") {
+        // Directory
+        await fs.promises.mkdir(entryPath, { recursive: true });
+        await GitCommand.checkoutTree(entry.hash, entryPath);
+      } else {
+        // File
+        const fileBuffer = await GitCommand.readGitObject(entry.hash);
+        const { content: fileContent } = await GitCommand.inflateObject(
+          fileBuffer
+        );
+        await fs.promises.writeFile(entryPath, fileContent);
+      }
+    }
+  }
 }
 
 async function main() {
@@ -335,6 +526,15 @@ async function main() {
         break;
       }
 
+      case Commands.Clone:
+        if (args.length < 3) {
+          throw new Error("Usage: clone <repository-url> <target-directory>");
+        }
+        const repoUrl = args[1];
+        const targetDir = args[2];
+        await GitCloneCommand.clone(repoUrl, targetDir);
+        break;
+
       default:
         throw new Error(`Unknown command ${command}`);
     }
@@ -346,6 +546,13 @@ async function main() {
     }
     process.exit(1);
   }
+}
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
 }
 
 main();
